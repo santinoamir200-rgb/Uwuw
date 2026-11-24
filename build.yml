@@ -1,0 +1,480 @@
+name: Build OpenTyrian APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.9 }
+
+      - name: Bajar OpenTyrian y SDL2
+        run: |
+          git clone --depth 1 https://github.com/opentyrian/opentyrian.git ot
+          git clone --depth 1 --branch release-2.30.x https://github.com/libsdl-org/SDL.git sdl
+
+      - name: Parchear OpenTyrian para Android
+        run: |
+          cat > patch.py <<'PYEOF'
+          import os
+          os.chdir("ot")
+
+          # ---------- tyrian2.c: flag "estoy dentro de un nivel" ----------
+          p = "src/tyrian2.c"; s = open(p).read()
+          s = s.replace("void JE_main(void)\n{\n\tchar buffer[256];",
+                        "bool touchInLevel = false;\n\nvoid JE_main(void)\n{\n\tchar buffer[256];\n\n\ttouchInLevel = false;", 1)
+          s = s.replace("start_level:\n\n\tkeyboardClearInput();",
+                        "start_level:\n\n\ttouchInLevel = false;\n\tkeyboardClearInput();", 1)
+          assert "\tJE_loadMap();\n" in s
+          s = s.replace("\tJE_loadMap();\n", "\tJE_loadMap();\n\ttouchInLevel = true;\n", 1)
+          open(p, "w").write(s)
+
+          # ---------- keyboard.c: controles tactiles ----------
+          touch = r'''
+          #ifdef __ANDROID__
+          // Izquierda: stick flotante (flechas). Derecha-abajo: disparo.
+          // Derecha-arriba: sidekicks. Solo actua dentro de un nivel.
+          extern bool touchInLevel;
+
+          typedef struct { SDL_FingerID id; bool used; float ox, oy; int role; } TouchFinger;
+          enum { ROLE_STICK, ROLE_FIRE, ROLE_SIDE_L, ROLE_SIDE_R };
+          static TouchFinger touchFingers[8];
+
+          static void touchSetStick(float dx, float dy)
+          {
+              const float dead = 0.025f;
+              keysactive[SDL_SCANCODE_LEFT]  = dx < -dead;
+              keysactive[SDL_SCANCODE_RIGHT] = dx >  dead;
+              keysactive[SDL_SCANCODE_UP]    = dy < -dead * 1.7f;
+              keysactive[SDL_SCANCODE_DOWN]  = dy >  dead * 1.7f;
+          }
+
+          static void touchRelease(int role)
+          {
+              switch (role)
+              {
+              case ROLE_STICK:  touchSetStick(0, 0); break;
+              case ROLE_FIRE:   keysactive[SDL_SCANCODE_SPACE] = false; break;
+              case ROLE_SIDE_L: keysactive[SDL_SCANCODE_LCTRL] = false; break;
+              case ROLE_SIDE_R: keysactive[SDL_SCANCODE_LALT] = false; break;
+              }
+          }
+
+          static void touchReleaseAll(void)
+          {
+              for (size_t i = 0; i < COUNTOF(touchFingers); ++i)
+              {
+                  if (touchFingers[i].used)
+                  {
+                      touchRelease(touchFingers[i].role);
+                      touchFingers[i].used = false;
+                  }
+              }
+          }
+
+          static void touchHandleFinger(const SDL_TouchFingerEvent *f, Uint32 type)
+          {
+              if (!touchInLevel)
+              {
+                  touchReleaseAll();
+                  return;
+              }
+
+              TouchFinger *tf = NULL;
+              for (size_t i = 0; i < COUNTOF(touchFingers); ++i)
+                  if (touchFingers[i].used && touchFingers[i].id == f->fingerId)
+                      tf = &touchFingers[i];
+
+              if (type == SDL_FINGERDOWN && tf == NULL)
+              {
+                  for (size_t i = 0; i < COUNTOF(touchFingers); ++i)
+                      if (!touchFingers[i].used) { tf = &touchFingers[i]; break; }
+                  if (tf == NULL)
+                      return;
+
+                  tf->used = true;
+                  tf->id = f->fingerId;
+                  tf->ox = f->x;
+                  tf->oy = f->y;
+
+                  if (f->x < 0.5f)
+                      tf->role = ROLE_STICK;
+                  else if (f->y >= 0.4f)
+                  {
+                      tf->role = ROLE_FIRE;
+                      keysactive[SDL_SCANCODE_SPACE] = true;
+                  }
+                  else if (f->x < 0.75f)
+                  {
+                      tf->role = ROLE_SIDE_L;
+                      keysactive[SDL_SCANCODE_LCTRL] = true;
+                  }
+                  else
+                  {
+                      tf->role = ROLE_SIDE_R;
+                      keysactive[SDL_SCANCODE_LALT] = true;
+                  }
+              }
+              else if (tf != NULL && type == SDL_FINGERMOTION && tf->role == ROLE_STICK)
+              {
+                  float dx = f->x - tf->ox, dy = f->y - tf->oy;
+                  touchSetStick(dx, dy);
+                  const float maxx = 0.06f, maxy = 0.1f;
+                  if (dx >  maxx) tf->ox = f->x - maxx;
+                  if (dx < -maxx) tf->ox = f->x + maxx;
+                  if (dy >  maxy) tf->oy = f->y - maxy;
+                  if (dy < -maxy) tf->oy = f->y + maxy;
+              }
+              else if (tf != NULL && type == SDL_FINGERUP)
+              {
+                  touchRelease(tf->role);
+                  tf->used = false;
+              }
+          }
+          #endif
+          '''
+          p = "src/keyboard.c"; s = open(p).read()
+          head = "void handleSdlEvents(void)\n{\n"
+          i = s.index(head)
+          s = s[:i] + touch + "\n" + s[i:]
+          s = s.replace(head, head +
+              "#ifdef __ANDROID__\n"
+              "\tSDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, touchInLevel ? \"0\" : \"1\");\n"
+              "#endif\n", 1)
+          case = ("#ifdef __ANDROID__\n"
+                  "\t\t\tcase SDL_FINGERDOWN:\n\t\t\tcase SDL_FINGERMOTION:\n\t\t\tcase SDL_FINGERUP:\n"
+                  "\t\t\t\ttouchHandleFinger(&ev.tfinger, ev.type);\n\t\t\t\tbreak;\n"
+                  "#endif\n\n\t\t\tcase SDL_MOUSEMOTION:")
+          assert "\t\t\tcase SDL_MOUSEMOTION:" in s
+          s = s.replace("\t\t\tcase SDL_MOUSEMOTION:", case, 1)
+          back = ("#ifdef __ANDROID__\n"
+                  "\t\t\t\tif (ev.key.keysym.scancode == SDL_SCANCODE_AC_BACK)\n"
+                  "\t\t\t\t{\n\t\t\t\t\tev.key.keysym.scancode = SDL_SCANCODE_ESCAPE;\n"
+                  "\t\t\t\t\tev.key.keysym.sym = SDLK_ESCAPE;\n\t\t\t\t}\n#endif\n")
+          assert "\t\t\tcase SDL_KEYDOWN:\n" in s and "\t\t\tcase SDL_KEYUP:\n" in s
+          s = s.replace("\t\t\tcase SDL_KEYDOWN:\n", "\t\t\tcase SDL_KEYDOWN:\n" + back, 1)
+          s = s.replace("\t\t\tcase SDL_KEYUP:\n", "\t\t\tcase SDL_KEYUP:\n" + back, 1)
+          open(p, "w").write(s)
+
+          # ---------- file.c: rutas de datos y config en Android ----------
+          p = "src/file.c"; s = open(p).read()
+          a = '\tconst char *filename = "tyrian1.lvl";\n'
+          assert a in s
+          s = s.replace(a, a + (
+              "\n#ifdef __ANDROID__\n"
+              "\tif (customDataDirPath == NULL)\n\t{\n"
+              "\t\tconst char *ext = SDL_AndroidGetExternalStoragePath();\n"
+              "\t\tif (ext != NULL)\n\t\t{\n"
+              "\t\t\tsize_t n = strlen(ext) + strlen(\"/data\") + 1;\n"
+              "\t\t\tchar *dp = malloc(n);\n"
+              "\t\t\tsnprintf(dp, n, \"%s/data\", ext);\n"
+              "\t\t\tcustomDataDirPath = dp;\n"
+              "\t\t}\n\t}\n#endif\n"), 1)
+          b = "\t\tfree(userDirPath);\n\t\tuserDirPathLen = 0;\n\t}\n"
+          assert b in s
+          s = s.replace(b, b + (
+              "\n#ifdef __ANDROID__\n"
+              "\t{\n\t\tconst char *internal = SDL_AndroidGetInternalStoragePath();\n"
+              "\t\tif (internal != NULL)\n\t\t{\n"
+              "\t\t\tuserDirPathLen = strlen(internal);\n"
+              "\t\t\tuserDirPath = malloc(userDirPathLen + 1);\n"
+              "\t\t\tmemcpy(userDirPath, internal, userDirPathLen + 1);\n"
+              "\t\t\treturn;\n\t\t}\n\t}\n#endif\n"), 1)
+          open(p, "w").write(s)
+          print("parches OK")
+          PYEOF
+          python3 patch.py
+
+      - name: Armar proyecto Android
+        run: |
+          P=app-proj
+          mkdir -p $P/app/src/main/{java/org/libsdl/app,java/org/opentyrian,cpp,res/values,res/drawable,res/drawable-nodpi,res/mipmap-xxxhdpi,res/mipmap-anydpi-v26,assets/data}
+          cp sdl/android-project/app/src/main/java/org/libsdl/app/*.java $P/app/src/main/java/org/libsdl/app/
+          cp -r sdl $P/app/src/main/cpp/SDL && rm -rf $P/app/src/main/cpp/SDL/.git
+          cp -r ot/src $P/app/src/main/cpp/opentyrian_src
+
+          # datos freeware de Tyrian 2.1 dentro del APK (si falla la descarga, se copian a mano)
+          (cd ot && bash ./get_data.sh ../$P/app/src/main/assets/data) || echo "sin datos de juego en el APK"
+          ls $P/app/src/main/assets/data | head -5 || true
+
+          cat > $P/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "OpenTyrian-Android"
+          include ':app'
+          EOF
+          cat > $P/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+          cat > $P/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          EOF
+          cat > $P/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'org.opentyrian'
+              compileSdk 34
+              ndkVersion '26.1.10909125'
+              defaultConfig {
+                  applicationId 'org.opentyrian.android'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName '2.1-android'
+                  ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
+                  externalNativeBuild { cmake { arguments '-DANDROID_STL=none' } }
+              }
+              externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' } }
+              androidResources { noCompress 'lvl', 'shp', 'pcx', 'dat', 'cdt', 'snd', 'mus', 'tyr', 'sh', 'lds', 'ctl', 'fnt', 'bin', 'pic', 'anm' }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+          cat > $P/app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22)
+          project(OpenTyrianAndroid C)
+          set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+          set(SDL_SHARED ON CACHE BOOL "" FORCE)
+          set(SDL_TEST OFF CACHE BOOL "" FORCE)
+          add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/SDL SDL2-build)
+          file(GLOB OT_SRC ${CMAKE_CURRENT_SOURCE_DIR}/opentyrian_src/*.c)
+          add_library(main SHARED ${OT_SRC})
+          target_include_directories(main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/opentyrian_src)
+          target_compile_definitions(main PRIVATE TARGET_ANDROID NDEBUG TYRIAN_DIR="" OPENTYRIAN_VERSION="2.1-android")
+          target_compile_options(main PRIVATE -std=gnu99 -O2)
+          target_link_libraries(main PRIVATE SDL2main SDL2 m log)
+          EOF
+          cat > $P/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:allowBackup="true"
+                  android:hardwareAccelerated="true"
+                  android:theme="@style/Splash">
+                  <activity
+                      android:name=".OpenTyrianActivity"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:screenOrientation="sensorLandscape"
+                      android:launchMode="singleInstance"
+                      android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+                      android:preferMinimalPostProcessing="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > $P/app/src/main/java/org/opentyrian/OpenTyrianActivity.java <<'EOF'
+          package org.opentyrian;
+
+          import android.content.res.AssetManager;
+          import android.os.Bundle;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import org.libsdl.app.SDLActivity;
+
+          public class OpenTyrianActivity extends SDLActivity {
+              @Override
+              protected String[] getLibraries() {
+                  return new String[] { "SDL2", "main" };
+              }
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  try { installData(); } catch (Exception e) { e.printStackTrace(); }
+                  super.onCreate(savedInstanceState);
+              }
+
+              // Copia los datos de Tyrian (assets/data) al almacenamiento de la app la primera vez.
+              private void installData() throws Exception {
+                  File ext = getExternalFilesDir(null);
+                  if (ext == null) return;
+                  File dir = new File(ext, "data");
+                  if (new File(dir, "tyrian1.lvl").exists()) return;
+                  AssetManager am = getAssets();
+                  String[] names = am.list("data");
+                  if (names == null || names.length == 0) return;
+                  dir.mkdirs();
+                  byte[] buf = new byte[65536];
+                  for (String n : names) {
+                      try (InputStream in = am.open("data/" + n);
+                           OutputStream out = new FileOutputStream(new File(dir, n))) {
+                          int r;
+                          while ((r = in.read(buf)) > 0) out.write(buf, 0, r);
+                      }
+                  }
+              }
+          }
+          EOF
+          cat > $P/app/src/main/res/values/strings.xml <<'EOF'
+          <resources><string name="app_name">OpenTyrian</string></resources>
+          EOF
+
+      - name: Generar portada e iconos
+        run: |
+          pip install pillow
+          cat > art.py <<'PYEOF'
+          import os, random, math
+          from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+
+          OUT = os.environ.get("ART_OUT", "out")
+          os.makedirs(OUT, exist_ok=True)
+
+          def font(size):
+              for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"):
+                  if os.path.exists(p):
+                      return ImageFont.truetype(p, size)
+              return ImageFont.load_default()
+
+          def space(w, h, seed=7):
+              rnd = random.Random(seed)
+              img = Image.new("RGB", (w, h))
+              px = img.load()
+              top, bot = (6, 8, 28), (26, 12, 58)
+              for y in range(h):
+                  t = y / (h - 1)
+                  c = tuple(int(top[i] + (bot[i] - top[i]) * t) for i in range(3))
+                  for x in range(w):
+                      px[x, y] = c
+              glow = Image.new("RGB", (w, h), (0, 0, 0))
+              g = ImageDraw.Draw(glow)
+              for cx, cy, r, col in ((0.75, 0.30, 0.45, (90, 40, 140)), (0.2, 0.75, 0.40, (20, 70, 130))):
+                  g.ellipse((cx*w - r*w, cy*h - r*w*0.6, cx*w + r*w, cy*h + r*w*0.6), fill=col)
+              glow = glow.filter(ImageFilter.GaussianBlur(w // 6))
+              img = ImageChops.add(img, glow)
+              d = ImageDraw.Draw(img)
+              for _ in range(w * h // 5000):
+                  x, y = rnd.randrange(w), rnd.randrange(h)
+                  b = rnd.randrange(120, 256)
+                  s = 1 if rnd.random() < .85 else 2
+                  d.ellipse((x, y, x + s, y + s), fill=(b, b, min(255, b + 20)))
+              return img
+
+          def ship(size, cx, cy, flame=True):
+              """Draws an original fighter pointing up on a transparent layer."""
+              L = Image.new("RGBA", size, (0, 0, 0, 0))
+              d = ImageDraw.Draw(L)
+              s = min(size) / 100.0
+              def P(pts): return [(cx + x * s, cy + y * s) for x, y in pts]
+              if flame:
+                  d.polygon(P([(-6, 30), (0, 62), (6, 30)]), fill=(255, 160, 30, 255))
+                  d.polygon(P([(-3, 30), (0, 48), (3, 30)]), fill=(255, 240, 150, 255))
+              d.polygon(P([(-46, 34), (-12, -2), (-10, 26), (-22, 36)]), fill=(52, 120, 200, 255))
+              d.polygon(P([(46, 34), (12, -2), (10, 26), (22, 36)]), fill=(52, 120, 200, 255))
+              d.polygon(P([(0, -50), (14, 6), (11, 34), (0, 28), (-11, 34), (-14, 6)]), fill=(210, 225, 245, 255))
+              d.polygon(P([(0, -50), (14, 6), (0, 0)]), fill=(240, 247, 255, 255))
+              d.polygon(P([(0, -26), (6, -4), (0, 4), (-6, -4)]), fill=(40, 200, 255, 255))
+              d.line(P([(0, -50), (14, 6), (11, 34), (0, 28), (-11, 34), (-14, 6), (0, -50)]), fill=(20, 40, 80, 255), width=max(2, int(s * 1.5)))
+              return L
+
+          def glowlayer(L, radius):
+              a = L.split()[3].filter(ImageFilter.GaussianBlur(radius))
+              g = Image.new("RGBA", L.size, (80, 190, 255, 0))
+              g.putalpha(a.point(lambda v: int(v * 0.8)))
+              return g
+
+          # ---- splash / portada 1920x1080 ----
+          W, H = 1920, 1080
+          bg = space(W, H).convert("RGBA")
+          sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+          ship_img = ship((600, 600), 300, 300)
+          ship_img = ship_img.resize((560, 560), Image.LANCZOS)
+          sh.paste(ship_img, (W // 2 - 280, int(H * 0.40) - 280), ship_img)
+          bg = Image.alpha_composite(bg, glowlayer(sh, 30))
+          bg = Image.alpha_composite(bg, sh)
+          d = ImageDraw.Draw(bg)
+          f1, f2 = font(150), font(46)
+          t = "OPENTYRIAN"
+          tw = d.textlength(t, font=f1)
+          for off, col in ((6, (10, 20, 60, 255)), (0, (235, 245, 255, 255))):
+              d.text(((W - tw) / 2 + off, H * 0.70 + off), t, font=f1, fill=col)
+          sub = "VERSION ANDROID"
+          sw = d.textlength(sub, font=f2)
+          d.text(((W - sw) / 2, H * 0.70 + 175), sub, font=f2, fill=(255, 179, 0, 255))
+          bg.convert("RGB").save(f"{OUT}/splash.png")
+
+          # ---- adaptive icon: 432x432 foreground (safe zone = centre 66%), bg solid ----
+          fg = Image.new("RGBA", (432, 432), (0, 0, 0, 0))
+          si = ship((400, 400), 200, 200).resize((250, 250), Image.LANCZOS)
+          fg.paste(si, (91, 80), si)
+          fg.save(f"{OUT}/ic_launcher_fg.png")
+
+          # ---- legacy icon 192x192 (Android < 8) ----
+          ic = space(192, 192, seed=3).convert("RGBA")
+          ics = ship((400, 400), 200, 200).resize((150, 150), Image.LANCZOS)
+          ic.paste(ics, (21, 20), ics)
+          mask = Image.new("L", (192, 192), 0)
+          ImageDraw.Draw(mask).rounded_rectangle((0, 0, 191, 191), 36, fill=255)
+          ic.putalpha(mask)
+          ic.save(f"{OUT}/ic_launcher.png")
+          print("art OK")
+
+          PYEOF
+          ART_OUT=art-out python3 art.py
+          R=app-proj/app/src/main/res
+          cp art-out/splash.png art-out/ic_launcher_fg.png $R/drawable-nodpi/
+          cp art-out/ic_launcher.png $R/mipmap-xxxhdpi/ic_launcher.png
+          cat > $R/values/colors.xml <<'EOF'
+          <resources><color name="ic_bg">#0B1030</color></resources>
+          EOF
+          cat > $R/drawable/splash_bg.xml <<'EOF'
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item><color android:color="#0B1030"/></item>
+              <item><bitmap android:src="@drawable/splash" android:gravity="center"/></item>
+          </layer-list>
+          EOF
+          cat > $R/values/styles.xml <<'EOF'
+          <resources>
+              <style name="Splash" parent="@android:style/Theme.NoTitleBar.Fullscreen">
+                  <item name="android:windowBackground">@drawable/splash_bg</item>
+              </style>
+          </resources>
+          EOF
+          cat > $R/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_bg"/>
+              <foreground android:drawable="@drawable/ic_launcher_fg"/>
+          </adaptive-icon>
+          EOF
+
+      - name: Instalar NDK y CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: Compilar
+        run: cd app-proj && gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenTyrian-apk
+          path: app-proj/app/build/outputs/apk/debug/app-debug.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portada
+          path: art-out/splash.png
