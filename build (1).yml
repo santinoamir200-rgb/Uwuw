@@ -1,0 +1,39 @@
+name: Build OpenTyrian APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.9 }
+
+      - name: Preparar proyecto
+        run: |
+          unzip -q ./proyecto*.zip
+          P=app-proj/app/src/main
+          git clone --depth 1 --branch release-2.30.x https://github.com/libsdl-org/SDL.git $P/cpp/SDL
+          cp $P/cpp/SDL/android-project/app/src/main/java/org/libsdl/app/*.java $P/java/org/libsdl/app/
+          rm -rf $P/cpp/SDL/.git
+          git clone --depth 1 https://github.com/opentyrian/opentyrian.git /tmp/ot
+          (cd /tmp/ot && bash ./get_data.sh "$GITHUB_WORKSPACE/$P/assets/data") || echo "sin datos de juego"
+          ls $P/assets/data | head
+
+      - name: Instalar NDK y CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: Compilar
+        run: cd app-proj && gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenTyrian-apk
+          path: app-proj/app/build/outputs/apk/debug/app-debug.apk
